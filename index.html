@@ -284,8 +284,11 @@ const TTS=(()=>{
   if("speechSynthesis" in window){load();speechSynthesis.onvoiceschanged=load;}
   function list(lang){ const pre=lang.slice(0,2); return voices.filter(v=>v.lang&&v.lang.toLowerCase().startsWith(pre)); }
   function pick(lang){ const want=S.settings.voices[lang]; const ls=list(lang); if(!ls.length) return null;
-    if(want){ const v=ls.find(v=>v.name===want); if(v) return v; }
-    return ls.find(v=>v.lang.replace("_","-")===LANGS[lang].code&&/premium|enhanced|natural|neural/i.test(v.name))||ls.find(v=>v.lang.replace("_","-")===LANGS[lang].code)||ls[0]; }
+    if(want){ const v=ls.find(v=>v.voiceURI===want)||ls.find(v=>v.name===want); if(v) return v; }
+    const hq=v=>/premium|enhanced|natural|neural|google/i.test(v.name+" "+(v.voiceURI||""));
+    return ls.find(v=>v.lang.replace("_","-")===LANGS[lang].code&&hq(v))||ls.find(v=>v.lang.replace("_","-")===LANGS[lang].code)||ls[0]; }
+  function tier(v){ const u=(v.voiceURI||"")+" "+v.name; if(/premium/i.test(u)) return "프리미엄"; if(/enhanced/i.test(u)) return "향상됨"; if(/google/i.test(u)) return "Google"; if(/eloquence|novelty|speech\.synthesis\.voice/i.test(u)) return "저품질"; if(/compact/i.test(u)) return "기본"; return ""; }
+  function rank(v){ return {"프리미엄":0,"향상됨":1,"Google":2,"":3,"기본":4,"저품질":5}[tier(v)]; }
   let cur=null;
   function speak(text,lang,rate,onBoundary,onEnd){
     if(!("speechSynthesis" in window)){toast("이 브라우저는 음성 합성을 지원하지 않습니다");return;}
@@ -295,7 +298,7 @@ const TTS=(()=>{
     cur=u; speechSynthesis.speak(u);
   }
   function stop(){ if("speechSynthesis" in window){speechSynthesis.cancel();} cur=null; }
-  return {speak,stop,list,pick,speaking:()=>!!cur};
+  return {speak,stop,list,pick,tier,rank,speaking:()=>!!cur};
 })();
 const REC=(()=>{
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition; let r=null;
@@ -620,11 +623,12 @@ function aiStatusText(){
 function renderSettings(){
   setTop(`<span class="brand">LECTIO</span><span class="sub">설정</span>`);
   const voiceRows=Object.entries(LANGS).map(([k,v])=>{ const ls=TTS.list(k); const cur=TTS.pick(k);
-    return `<label class="f">${v.ko} 음성 <select data-voice="${k}">${ls.length?ls.map(x=>`<option value="${esc(x.name)}" ${cur&&cur.name===x.name?"selected":""}>${esc(x.name)} (${x.lang})</option>`).join(""):"<option>기기에 음성 없음</option>"}</select></label>`; }).join("");
+    return `<label class="f">${v.ko} 음성 <select data-voice="${k}">${ls.length?ls.slice().sort((a,b)=>TTS.rank(a)-TTS.rank(b)).map(x=>`<option value="${esc(x.voiceURI||x.name)}" ${cur&&(cur.voiceURI||cur.name)===(x.voiceURI||x.name)?"selected":""}>${TTS.tier(x)?"★ ".repeat(TTS.rank(x)<2?1:0)+"["+TTS.tier(x)+"] ":""}${esc(x.name)} (${x.lang})</option>`).join(""):"<option>기기에 음성 없음</option>"}</select></label>`; }).join("");
   $("main").innerHTML=`<div class="stack">
     <div class="card stack">
       <div class="eyebrow">음성</div>
       ${voiceRows}
+      <p class="small muted" style="margin:0">[향상됨]·[프리미엄] 표시는 기기가 알려주는 음성 식별자(voiceURI)로 판별합니다. 이름이 같은 음성이 두 개 보이면 표시가 붙은 쪽이 고품질입니다.</p>
       <p class="small muted" style="margin:0">iPhone은 설정 › 손쉬운 사용 › 음성 콘텐츠 › 음성에서 언어별 고품질 음성을 내려받으면 여기 목록에 나타납니다. Android는 Google TTS 설정에서 언어별 음성을 설치하세요.</p>
       <label class="f">기본 재생 속도 <select id="set-rate">${RATES.map((r,i)=>`<option value="${i}" ${i===S.rateI?"selected":""}>${r.toFixed(1)}×</option>`).join("")}</select></label>
     </div>
