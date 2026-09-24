@@ -209,13 +209,13 @@ const DB=(()=>{
     if(p) return p;
     p=new Promise((res,rej)=>{
       try{
-        const r=indexedDB.open("lectio",1);
-        r.onupgradeneeded=e=>{const d=e.target.result;["packs","cards","kv"].forEach(n=>{if(!d.objectStoreNames.contains(n)) d.createObjectStore(n,{keyPath:n==="kv"?"k":"id"});});};
+        const r=indexedDB.open("lectio",2);
+        r.onupgradeneeded=e=>{const d=e.target.result;["packs","cards","kv","audio"].forEach(n=>{if(!d.objectStoreNames.contains(n)) d.createObjectStore(n,{keyPath:n==="kv"?"k":"id"});});};
         r.onsuccess=e=>res(e.target.result);
         r.onerror=e=>rej(e.target.error);
         r.onblocked=()=>rej(new Error("blocked"));
       }catch(err){rej(err);}
-    }).catch(()=>{mem={packs:new Map(),cards:new Map(),kv:new Map()};return null;});
+    }).catch(()=>{mem={packs:new Map(),cards:new Map(),kv:new Map(),audio:new Map()};return null;});
     return p;
   }
   async function tx(store,mode,fn){
@@ -290,15 +290,57 @@ const TTS=(()=>{
   function tier(v){ const u=(v.voiceURI||"")+" "+v.name; if(/premium/i.test(u)) return "프리미엄"; if(/enhanced/i.test(u)) return "향상됨"; if(/google/i.test(u)) return "Google"; if(/eloquence|novelty|speech\.synthesis\.voice/i.test(u)) return "저품질"; if(/compact/i.test(u)) return "기본"; return ""; }
   function rank(v){ return {"프리미엄":0,"향상됨":1,"Google":2,"":3,"기본":4,"저품질":5}[tier(v)]; }
   let cur=null;
-  function speak(text,lang,rate,onBoundary,onEnd){
+  function devSpeak(text,lang,rate,onBoundary,onEnd){
     if(!("speechSynthesis" in window)){toast("이 브라우저는 음성 합성을 지원하지 않습니다");return;}
-    stop(); const u=new SpeechSynthesisUtterance(text); u.lang=LANGS[lang].code; const v=pick(lang); if(v) u.voice=v; u.rate=rate; u.pitch=1;
+    const u=new SpeechSynthesisUtterance(text); u.lang=LANGS[lang].code; const v=pick(lang); if(v) u.voice=v; u.rate=rate; u.pitch=1;
     u.onboundary=e=>{ if(onBoundary&&e.name==="word") onBoundary(e.charIndex); };
     u.onend=()=>{cur=null;onEnd&&onEnd();}; u.onerror=()=>{cur=null;onEnd&&onEnd();};
     cur=u; speechSynthesis.speak(u);
   }
-  function stop(){ if("speechSynthesis" in window){speechSynthesis.cancel();} cur=null; }
-  return {speak,stop,list,pick,tier,rank,speaking:()=>!!cur};
+  /* ---- cloud (Google Cloud Text-to-Speech) ---- */
+  const SILENT="data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA";
+  let audioEl=null, unlocked=false, raf=0;
+  function el(){ if(!audioEl){ audioEl=new Audio(); audioEl.preload="auto"; audioEl.setAttribute("playsinline",""); } return audioEl; }
+  function unlock(){ if(unlocked) return; try{ const a=el(); a.src=SILENT; const p=a.play(); if(p&&p.catch) p.catch(()=>{}); unlocked=true; }catch(e){} }
+  document.addEventListener("touchend",unlock,{capture:true,passive:true}); document.addEventListener("click",unlock,{capture:true});
+  const cloud=()=>S.settings.cloud||{};
+  function cloudOn(lang){ const c=cloud(); return c.engine==="google"&&!!c.key; }
+  function cloudVoice(lang){ return (cloud().voices||{})[lang]||""; }
+  const TIERS=[["Chirp3-HD",0],["Chirp-HD",1],["Studio",2],["Journey",3],["Neural2",4],["Wavenet",5],["Polyglot",6],["Standard",7]];
+  function cloudTier(name){ for(const [k,r] of TIERS) if(name.includes(k)) return {label:k,rank:r}; return {label:"",rank:9}; }
+  async function listCloud(lang){
+    const code=LANGS[lang].code; const r=await fetch(`https://texttospeech.googleapis.com/v1/voices?languageCode=${code}&key=${encodeURIComponent(cloud().key)}`);
+    if(!r.ok){ let m=r.status+""; try{ m=(await r.json()).error?.message||m; }catch(e){} throw new Error(m); }
+    const j=await r.json(); return (j.voices||[]).filter(v=>(v.languageCodes||[]).includes(code)).map(v=>({name:v.name,gender:v.ssmlGender,...cloudTier(v.name)})).sort((a,b)=>a.rank-b.rank||a.name.localeCompare(b.name));
+  }
+  function audioId(text,lang,rate){ return `g|${cloudVoice(lang)||LANGS[lang].code}|${rate}|${text}`; }
+  async function synth(text,lang,rate){
+    const id=audioId(text,lang,rate); let row=null; try{ row=await DB.get("audio",id); }catch(e){}
+    if(row&&row.blob) return row.blob;
+    const code=LANGS[lang].code; const name=cloudVoice(lang);
+    const body={input:{text},voice:{languageCode:code,...(name?{name}:{})},audioConfig:{audioEncoding:"MP3",speakingRate:rate}};
+    const r=await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${encodeURIComponent(cloud().key)}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(!r.ok){ let m=r.status+""; try{ m=(await r.json()).error?.message||m; }catch(e){} throw new Error(m); }
+    const j=await r.json(); const bin=atob(j.audioContent); const u8=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+    const blob=new Blob([u8],{type:"audio/mpeg"});
+    try{ await DB.put("audio",{id,blob,lang,chars:text.length,bytes:blob.size,created:Date.now()}); }catch(e){}
+    return blob;
+  }
+  async function cached(text,lang,rate){ try{ const row=await DB.get("audio",audioId(text,lang,rate)); return !!(row&&row.blob); }catch(e){ return false; } }
+  async function cloudSpeak(text,lang,rate,onBoundary,onEnd){
+    const token=cur={cloud:true};
+    let blob; try{ blob=await synth(text,lang,rate); }catch(e){ if(cur!==token) return; cur=null; toast("클라우드 음성 실패 — 기기 음성으로 재생 ("+(e.message||e).slice(0,80)+")"); devSpeak(text,lang,rate,onBoundary,onEnd); return; }
+    if(cur!==token) return;
+    const a=el(); const url=URL.createObjectURL(blob); a.src=url;
+    const total=text.length; cancelAnimationFrame(raf);
+    const tick=()=>{ if(cur!==token) return; if(onBoundary&&a.duration&&!a.paused){ onBoundary(Math.min(total-1,Math.floor(a.currentTime/a.duration*total))); } raf=requestAnimationFrame(tick); };
+    a.onended=()=>{ cancelAnimationFrame(raf); URL.revokeObjectURL(url); if(cur===token){ cur=null; onEnd&&onEnd(); } };
+    a.onerror=()=>{ cancelAnimationFrame(raf); if(cur===token){ cur=null; onEnd&&onEnd(); } };
+    try{ await a.play(); raf=requestAnimationFrame(tick); }catch(e){ cur=null; toast("재생이 막혔습니다. 화면을 한 번 터치한 뒤 다시 누르세요."); onEnd&&onEnd(); }
+  }
+  function speak(text,lang,rate,onBoundary,onEnd){ stop(); if(cloudOn(lang)) cloudSpeak(text,lang,rate,onBoundary,onEnd); else devSpeak(text,lang,rate,onBoundary,onEnd); }
+  function stop(){ if("speechSynthesis" in window){speechSynthesis.cancel();} cancelAnimationFrame(raf); if(audioEl&&!audioEl.paused){ try{audioEl.pause();}catch(e){} } cur=null; }
+  return {speak,stop,list,pick,tier,rank,cloudOn,listCloud,synth,cached,cloudTier,speaking:()=>!!cur};
 })();
 const REC=(()=>{
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition; let r=null;
@@ -317,7 +359,7 @@ const REC=(()=>{
 })();
 
 /* ============ state ============ */
-const S={packs:[],cards:[],settings:{voices:{},rate:0.8,sampleDenied:false},view:"library",packId:null,idx:0,rateI:1,
+const S={packs:[],cards:[],settings:{voices:{},rate:0.8,sampleDenied:false,cloud:{engine:"device",key:"",voices:{}}},cloudVoices:{},view:"library",packId:null,idx:0,rateI:1,
   result:null,heard:"",recording:false,coaching:false,coachText:"",clozeLevel:1,revealed:new Set(),chain:1,
   cardQueue:[],cardFlip:false,sample:undefined,hlIndex:-1};
 let toastT=null;
@@ -488,7 +530,7 @@ function startRecord(p,target,onDone){
 }
 function renderRead(){
   const p=pack(); if(!p){go("library");return;} const s=sent(); const L=LANGS[p.lang];
-  setTop(`<button class="back" id="back" aria-label="서재로">${ICONS.back}</button><span style="font-family:var(--serif);font-size:17px;font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.title)}</span><span class="sub">${L.name}</span>`);
+  setTop(`<button class="back" id="back" aria-label="서재로">${ICONS.back}</button><span style="font-family:var(--serif);font-size:17px;font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.title)}</span><span class="sub">${L.name}${TTS.cloudOn(p.lang)?" · ☁︎":""}</span>`);
   const hasCoach=!!s.notes;
   const res=S.result;
   $("main").innerHTML=`<div class="stack">
@@ -624,9 +666,21 @@ function renderSettings(){
   setTop(`<span class="brand">LECTIO</span><span class="sub">설정</span>`);
   const voiceRows=Object.entries(LANGS).map(([k,v])=>{ const ls=TTS.list(k); const cur=TTS.pick(k);
     return `<label class="f">${v.ko} 음성 <select data-voice="${k}">${ls.length?ls.slice().sort((a,b)=>TTS.rank(a)-TTS.rank(b)).map(x=>`<option value="${esc(x.voiceURI||x.name)}" ${cur&&(cur.voiceURI||cur.name)===(x.voiceURI||x.name)?"selected":""}>${TTS.tier(x)?"★ ".repeat(TTS.rank(x)<2?1:0)+"["+TTS.tier(x)+"] ":""}${esc(x.name)} (${x.lang})</option>`).join(""):"<option>기기에 음성 없음</option>"}</select></label>`; }).join("");
+  const C=S.settings.cloud||{engine:"device",key:"",voices:{}};
+  const cloudRows=Object.entries(LANGS).map(([k,v])=>{ const ls=S.cloudVoices[k]; const cur=(C.voices||{})[k]||"";
+    return `<label class="f">${v.ko} 음성 <select data-cvoice="${k}">${ls?`<option value="">자동 (최상급)</option>`+ls.map(x=>`<option value="${esc(x.name)}" ${cur===x.name?"selected":""}>${x.label?"["+x.label+"] ":""}${esc(x.name)} · ${x.gender==="FEMALE"?"여":x.gender==="MALE"?"남":""}</option>`).join(""):`<option value="${esc(cur)}">${cur?esc(cur):"자동 (최상급)"} — 목록을 불러오면 고를 수 있습니다</option>`}</select></label>`; }).join("");
   $("main").innerHTML=`<div class="stack">
     <div class="card stack">
-      <div class="eyebrow">음성</div>
+      <div class="eyebrow">자연스러운 음성 · Google Cloud</div>
+      <label class="f">엔진 <select id="cl-engine"><option value="device" ${C.engine!=="google"?"selected":""}>기기 내장 음성</option><option value="google" ${C.engine==="google"?"selected":""}>Google Cloud Text-to-Speech (Chirp 3 HD)</option></select></label>
+      <label class="f">API 키 <input id="cl-key" type="password" autocomplete="off" placeholder="AIza…" value="${esc(C.key||"")}"></label>
+      <div class="row"><button class="btn sm" id="cl-list">음성 목록 불러오기</button><button class="btn sm" id="cl-test">테스트</button><span class="small muted" id="cl-status"></span></div>
+      ${cloudRows}
+      <div class="row"><span class="small muted grow" id="cl-cache">저장된 오디오 확인 중…</span><button class="btn sm ghost danger" id="cl-clear">오디오 비우기</button></div>
+      <p class="small muted" style="margin:0">키는 이 기기의 브라우저에만 저장됩니다. 한 번 들은 문장은 오디오로 저장되어 다음부터는 요청 없이 즉시·오프라인 재생됩니다. 재생에 실패하면 기기 음성으로 자동 전환합니다.</p>
+    </div>
+    <div class="card stack">
+      <div class="eyebrow">기기 내장 음성</div>
       ${voiceRows}
       <p class="small muted" style="margin:0">[향상됨]·[프리미엄] 표시는 기기가 알려주는 음성 식별자(voiceURI)로 판별합니다. 이름이 같은 음성이 두 개 보이면 표시가 붙은 쪽이 고품질입니다.</p>
       <p class="small muted" style="margin:0">iPhone은 설정 › 손쉬운 사용 › 음성 콘텐츠 › 음성에서 언어별 고품질 음성을 내려받으면 여기 목록에 나타납니다. Android는 Google TTS 설정에서 언어별 음성을 설치하세요.</p>
@@ -639,7 +693,7 @@ function renderSettings(){
     </div>
     <div class="card stack">
       <div class="eyebrow">대본</div>
-      ${S.packs.map(p=>`<div class="row"><span class="lang">${p.lang.toUpperCase()}</span><span class="grow" style="font-family:var(--serif)">${esc(p.title)}</span><button class="btn sm" data-exp="${p.id}">내보내기</button><button class="btn sm ghost danger" data-delp="${p.id}">삭제</button></div>`).join("")||"<div class='muted small'>대본 없음</div>"}
+      ${S.packs.map(p=>`<div class="row"><span class="lang">${p.lang.toUpperCase()}</span><span class="grow" style="font-family:var(--serif)">${esc(p.title)}</span><button class="btn sm" data-dl="${p.id}" title="이 대본의 모든 문장 오디오를 미리 저장">오디오 받기</button><button class="btn sm" data-exp="${p.id}">내보내기</button><button class="btn sm ghost danger" data-delp="${p.id}">삭제</button></div>`).join("")||"<div class='muted small'>대본 없음</div>"}
     </div>
     <div class="card stack">
       <div class="eyebrow">백업</div>
@@ -650,6 +704,14 @@ function renderSettings(){
   </div>`;
   $("main").querySelectorAll("[data-voice]").forEach(sl=>sl.onchange=()=>{S.settings.voices[sl.dataset.voice]=sl.value;saveSettings();TTS.speak({en:"Good evening.",es:"Buenas noches.",fr:"Bonsoir.",it:"Buonasera.",de:"Guten Abend."}[sl.dataset.voice],sl.dataset.voice,0.9);});
   $("set-rate").onchange=e=>{S.rateI=+e.target.value;S.settings.rate=RATES[S.rateI];saveSettings();};
+  const saveCloud=()=>{ S.settings.cloud={...(S.settings.cloud||{}),engine:$("cl-engine").value,key:$("cl-key").value.trim()}; saveSettings(); };
+  $("cl-engine").onchange=saveCloud; $("cl-key").onchange=saveCloud;
+  $("cl-list").onclick=async()=>{ saveCloud(); if(!S.settings.cloud.key){toast("API 키를 먼저 넣으세요");return;} $("cl-status").textContent="불러오는 중…"; try{ for(const k of Object.keys(LANGS)) S.cloudVoices[k]=await TTS.listCloud(k); render(); toast("음성 목록을 불러왔습니다"); }catch(e){ $("cl-status").textContent="실패: "+(e.message||e); } };
+  $("cl-test").onclick=()=>{ saveCloud(); if(S.settings.cloud.engine!=="google"){toast("엔진을 Google Cloud로 바꾸세요");return;} TTS.speak("Bonsoir. Voici la tête de Minerve, le poinçon de garantie.","fr",RATES[S.rateI]); };
+  $("main").querySelectorAll("[data-cvoice]").forEach(sl=>sl.onchange=()=>{ S.settings.cloud=S.settings.cloud||{}; S.settings.cloud.voices={...(S.settings.cloud.voices||{}),[sl.dataset.cvoice]:sl.value}; saveSettings(); if(S.settings.cloud.engine==="google") TTS.speak({en:"Good evening.",es:"Buenas noches.",fr:"Bonsoir.",it:"Buonasera.",de:"Guten Abend."}[sl.dataset.cvoice],sl.dataset.cvoice,0.9); });
+  (async()=>{ try{ const rows=await DB.all("audio")||[]; const mb=rows.reduce((a,r)=>a+(r.bytes||0),0)/1048576; const c=$("cl-cache"); if(c) c.textContent=`저장된 오디오 ${rows.length}개 · ${mb.toFixed(1)} MB`; }catch(e){} })();
+  $("cl-clear").onclick=async()=>{ if(!confirm("저장된 오디오를 모두 지울까요? 다시 들을 때 재요청됩니다.")) return; await DB.clear("audio"); render(); };
+  $("main").querySelectorAll("[data-dl]").forEach(b=>b.onclick=async()=>{ const p=S.packs.find(x=>x.id===b.dataset.dl); if(!TTS.cloudOn(p.lang)){toast("Google Cloud 엔진과 키를 먼저 설정하세요");return;} const rate=RATES[S.rateI]; let n=0,skip=0; b.disabled=true; for(const s of p.sentences){ if(await TTS.cached(s.t,p.lang,rate)){skip++;continue;} try{ await TTS.synth(s.t,p.lang,rate); n++; b.textContent=`${n+skip}/${p.sentences.length}`; }catch(e){ toast("중단: "+(e.message||e).slice(0,80)); break; } } b.disabled=false; toast(`오디오 ${n}개 저장 (이미 있음 ${skip})`); render(); });
   const exportText=obj=>{ const txt=JSON.stringify(obj); navigator.clipboard.writeText(txt).then(()=>toast("복사했습니다")).catch(()=>sheet(`<h2>백업</h2><textarea style="min-height:240px" readonly>${esc(txt)}</textarea><button class="btn" data-close>닫기</button>`)); };
   $("main").querySelectorAll("[data-exp]").forEach(b=>b.onclick=()=>exportText({packs:[S.packs.find(p=>p.id===b.dataset.exp)],cards:S.cards.filter(c=>c.packId===b.dataset.exp)}));
   $("main").querySelectorAll("[data-delp]").forEach(b=>b.onclick=async()=>{ const p=S.packs.find(x=>x.id===b.dataset.delp); if(!confirm(`'${p.title}' 대본과 그 카드를 삭제할까요?`)) return; S.packs=S.packs.filter(x=>x.id!==p.id); await DB.del("packs",p.id); for(const c of S.cards.filter(c=>c.packId===p.id)) await DB.del("cards",c.id); S.cards=S.cards.filter(c=>c.packId!==p.id); if(S.packId===p.id) S.packId=null; render(); });
